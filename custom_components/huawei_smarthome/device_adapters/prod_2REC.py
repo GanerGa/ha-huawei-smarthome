@@ -126,6 +126,60 @@ Profile 的 enumList 里 ``enumVal`` 一律是**字符串**（如 ``"2"``），
 这是 2QWL 适配中踩过的同类 bug，此处已从设计上规避。
 
 =====================================================================
+真机实测记录
+=====================================================================
+[已实测] **选模式不会启动空调**（用户报告，在 2RK1 上定位后确认本机同源）。
+
+现象：HA 的 climate 界面（本机只声明 hvac_modes + 温度/风速等）里，
+用户是通过**模式下拉菜单**操作的。空调处于关机态时选「制冷/制热」，
+空调没有反应；但选「关」能正常停机。
+
+根因**不在电源字段，也不在报文编码**，而在旧版 ``_set_hvac_mode`` 的
+逻辑缺口——选非 off 模式时**只发 mode，从不置电源位**：
+
+    if wanted == "off":
+        await _turn_off(...)          # 发 switch.on = 0  -> 能停机
+    else:
+        await send("mode", {...})     # 只发 mode，电源位保持 0
+
+本机 Profile 里**没有独立的"开机"服务**，电源就是 ``switch.on``。
+且 ``mode`` 的枚举里**没有 0/off**（1自动/2制冷/3除湿/4制热/5送风），
+无法用模式表达开关机。于是关机态下选模式，设备只收到模式，
+电源位仍是 0 —— 空调当然不启动。
+
+"关机生效"恰好反证了 ``switch.on`` **可写**（写 0 有效），
+所以问题不是字段权限、也不是取值编码。
+
+修复（见 ``_set_hvac_mode``）：
+  选任何非 off 模式时 = 先写 ``mode``，**再补写 ``switch.on = 1``**。
+  两步各自等待云端 ACK（集成对每个 sid 单飞，mode/switch 是不同 sid，
+  不会互相阻塞）。
+
+[ ] 待确认：本机修复后从模式下拉选「制冷/制热」，空调是否真的启动；
+    选「关」是否仍然正常停机。
+[ ] 待确认：选模式会顺带开机（这是刻意的，与智慧生活 App 行为一致）。
+    若你希望"选模式不改变电源状态"，需要改为先读电源位再决定是否补写。
+
+=====================================================================
+为什么诊断实体默认不创建
+=====================================================================
+`netInfo`（Wi-Fi 信号格数 / RSSI / IP / SSID / BSSID）与 `update.version`
+（固件版本）这 6 个实体在真机上**全部长期为 unknown** —— 设备不上报这些
+读取字段，集成侧也没有别的读取路径可以拿到。
+
+保留它们只会让设备页被一堆永远没有值的实体占满，用户还会以为是集成坏了。
+因此**默认不创建**。
+
+代码并未删除，而是收进 ``_make_diagnostic_entities()``，由模块级开关
+``_ENABLE_DIAGNOSTIC_ENTITIES``（当前 False）控制。
+若日后在真机上确认这些字段**确实会上报**（例如固件升级后行为改变），
+把该开关改为 True 即可全部恢复，无需重新实现。
+
+注意：开关打开后取值逻辑仍是原样——按 Profile 字段读取，不做任何猜测；
+设备不上报时依然显示 unknown。这是刻意的：宁可显示 unknown，
+也不给一个编造出来的网络状态。
+
+=====================================================================
 尚未验证（需真机确认）
 =====================================================================
 [ ] 状态读取：全部字段未在真机实测，仅依据 Profile 权限/枚举推导。
@@ -157,6 +211,12 @@ from typing import Any
 
 from .api import EntitySpec
 from .context import DeviceContext
+
+# 诊断实体（netInfo / update）总开关。
+# 真机实测：这些实体全部为 unknown，设备不上报对应字段。
+# 默认关闭以免污染界面；若日后确认真机会上报，改为 True 即可恢复。
+_ENABLE_DIAGNOSTIC_ENTITIES = False
+
 
 # --- 温度范围：取自本机 Profile（float，步进 0.5） -------------------
 _TEMP_MIN = 16.0
@@ -429,6 +489,13 @@ async def _set_hvac_mode(context: DeviceContext, data: Mapping[str, Any]) -> Non
     field = _field(context.profile, "mode", "mode")
     await context.async_send_service(
         "mode", {"mode": _enum_value(field, device_value, device_value)}
+    )
+    # 补开机位：本机没有独立的"开机"服务，电源就是 switch.on。
+    # 缺了这一步，空调处于关机态时从 HA 的模式下拉选模式不会启动空调
+    # （与 2RK1 的真机结论一致）。模式枚举里没有 0/off，
+    # 无法用模式表达关机，因此选模式必须显式置电源位。
+    await context.async_send_service(
+        "switch", {"on": _enum_value(_power_field(context), 1, 1)}
     )
 
 
@@ -886,53 +953,72 @@ class Product2RECAdapter:
                 )
             )
 
-        # --- 网络诊断 -------------------------------------------------
-        if context.has_service("netInfo"):
-            entities.append(
-                _make_sensor(
-                    "netInfo", "intensity", "wifi_signal_level",
-                    "Wi-Fi 信号格数",
-                    state_class="measurement", entity_category="diagnostic",
-                    decode=lambda value: _SIGNAL_LEVELS.get(_int(value) or -1),
-                )
-            )
-            entities.append(
-                _make_sensor(
-                    "netInfo", "RSSI", "wifi_rssi", "Wi-Fi 信号强度",
-                    unit="dBm", device_class="signal_strength",
-                    state_class="measurement", entity_category="diagnostic",
-                    decode=_int,
-                )
-            )
-            entities.append(
-                _make_sensor(
-                    "netInfo", "IP", "ip_address", "IP 地址",
-                    entity_category="diagnostic", decode=_text,
-                )
-            )
-            entities.append(
-                _make_sensor(
-                    "netInfo", "SSID", "wifi_ssid", "Wi-Fi SSID",
-                    entity_category="diagnostic", decode=_text,
-                )
-            )
-            entities.append(
-                _make_sensor(
-                    "netInfo", "BSSID", "bssid", "路由器 BSSID",
-                    entity_category="diagnostic", decode=_text,
-                )
-            )
-
-        # --- 固件版本（诊断） -----------------------------------------
-        if context.has_service("update"):
-            entities.append(
-                _make_sensor(
-                    "update", "version", "firmware_version", "固件版本",
-                    entity_category="diagnostic", decode=_text,
-                )
-            )
+        # --- 诊断实体（默认关闭，见文件头说明） ----------------------
+        if _ENABLE_DIAGNOSTIC_ENTITIES:
+            entities.extend(_make_diagnostic_entities(context))
 
         return tuple(entities)
 
+
+
+def _make_diagnostic_entities(
+    context: DeviceContext,
+) -> tuple[EntitySpec, ...]:
+    """Build the netInfo / update diagnostic entities.
+
+    默认不创建（见 ``_ENABLE_DIAGNOSTIC_ENTITIES``）。代码保留是为了：
+    若日后在真机上确认这些字段**确实会上报**，把开关打开即可恢复，
+    无需重新实现。取值逻辑未做任何猜测，仍是按 Profile 的字段读取。
+    """
+
+    out: list[EntitySpec] = []
+
+    # --- 网络诊断 -------------------------------------------------
+    if context.has_service("netInfo"):
+        out.append(
+            _make_sensor(
+                "netInfo", "intensity", "wifi_signal_level",
+                "Wi-Fi 信号格数",
+                state_class="measurement", entity_category="diagnostic",
+                decode=lambda value: _SIGNAL_LEVELS.get(_int(value) or -1),
+            )
+        )
+        out.append(
+            _make_sensor(
+                "netInfo", "RSSI", "wifi_rssi", "Wi-Fi 信号强度",
+                unit="dBm", device_class="signal_strength",
+                state_class="measurement", entity_category="diagnostic",
+                decode=_int,
+            )
+        )
+        out.append(
+            _make_sensor(
+                "netInfo", "IP", "ip_address", "IP 地址",
+                entity_category="diagnostic", decode=_text,
+            )
+        )
+        out.append(
+            _make_sensor(
+                "netInfo", "SSID", "wifi_ssid", "Wi-Fi SSID",
+                entity_category="diagnostic", decode=_text,
+            )
+        )
+        out.append(
+            _make_sensor(
+                "netInfo", "BSSID", "bssid", "路由器 BSSID",
+                entity_category="diagnostic", decode=_text,
+            )
+        )
+
+    # --- 固件版本（诊断） -----------------------------------------
+    if context.has_service("update"):
+        out.append(
+            _make_sensor(
+                "update", "version", "firmware_version", "固件版本",
+                entity_category="diagnostic", decode=_text,
+            )
+        )
+
+    return tuple(out)
 
 ADAPTER = Product2RECAdapter()
