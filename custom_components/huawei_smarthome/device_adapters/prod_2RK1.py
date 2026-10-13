@@ -13,6 +13,7 @@
 Profile 服务一览（含未映射项）
 =====================================================================
   switch.on                  bool RW 总开关            -> climate on/off
+                                ★ 单独写不生效，开机需先发 mode（见"真机实测记录"）
   mode.mode                  enum RW 运行模式           -> climate hvac_mode
   temperature.target         float RW 16.0~30.0 ℃ 步进0.5 -> climate target
   temperature.current        float R  室内温度          -> climate current
@@ -96,6 +97,54 @@ update/create/delete 驱动。正确写入必须先读取设备当前倒计时�
 智慧生活 App 中配置。
 
 =====================================================================
+真机实测记录
+=====================================================================
+[已实测] 读取：**完全正确**。在智慧生活 App 里控制空调后，HA 显示全部一致。
+[已实测] 关机：**生效**（从模式下拉选「关」，空调停机）。
+[已实测·已修复] **开机/选模式不生效**（用户报告，2026-10）。
+
+现象：
+  * 在 HA 里通过**模式下拉菜单**选「制冷/制热」→ 空调没反应；
+  * 但同样路径选「关」→ 能正常停机；
+  * HA 侧不报错，且在 App 里控制后 HA 状态显示正确。
+
+★ 根因（不是开关字段的问题，也不是 payload 类型问题）：
+
+  旧版 ``_set_hvac_mode`` 在选非 off 模式时**只发 mode，从不置电源位**：
+
+      if wanted == "off":
+          await _turn_off(...)          # 发 switch.on = 0  -> 能停机
+      else:
+          await send("mode", {...})     # 只发 mode，电源位保持 0
+          # （从未发送 switch.on = 1）
+
+  本机的 Profile 里 **没有独立的"开机"服务**，电源就是 ``switch.on``。
+  于是空调处于关机态时，用户选「制冷」只让设备收到 mode=2，
+  电源位仍是 0 —— 空调当然不启动。
+
+  而"关机生效"恰好说明 ``switch.on`` **是可写的**（写 0 有用），
+  进一步反证问题不在字段权限、也不在取值编码
+  （已验证 on/off 两个取值都是 int，编码对称）。
+
+关于 HA 界面形态（容易误判的地方）：
+  本机 climate 只声明了 hvac_modes + 温度/风速，**没有独立电源按钮**，
+  用户是从模式下拉菜单操作的。因此"开机"实际上走的是
+  ``set_hvac_mode`` 而不是 ``turn_on`` —— 旧版只修 ``turn_on``
+  是修不到这条路径的，必须让 set_hvac_mode 自己补开机位。
+
+修复（见 _set_hvac_mode / _turn_on）：
+  选任何非 off 模式时 = 先写 mode，**再补写 switch.on = 1**。
+  两步各自等待云端 ACK（集成对每个 sid 单飞，且 mode/switch 是不同
+  sid，不会互相阻塞）。
+
+[已实测] 修复**有效**：从模式下拉选非 off 模式，空调正常启动；
+    选「关」也能正常停机。两个方向均已确认。
+[ ] 待确认：开机后模式是否与所选一致（若被改成制冷，需检查回退逻辑）。
+[ ] 待确认：``switch.on=1`` 与 ``mode`` 连发两次命令时，若网络慢，
+    两步之间可能有数百毫秒间隔；真机上是否会出现"模式已切、电源未置"
+    的中间态（表现为短暂显示已开机但机身未启动）。
+
+=====================================================================
 报文类型（沿用 2MZN 的实测教训）
 =====================================================================
 Profile 的 enumList 里 ``enumVal`` 一律是**字符串**（如 ``"3"``），
@@ -110,13 +159,39 @@ descEn="Off"/"Auto" 与别的档位文本相似，一旦允许文本匹配就可
 命中错误档位（如 enumVal=100=关闭 与 1=自动辅热 的 descEn 冲突）。
 
 =====================================================================
+为什么诊断实体默认不创建
+=====================================================================
+`netInfo`（Wi-Fi 信号格数 / RSSI / IP / SSID / BSSID）与 `update.version`
+（固件版本）这 6 个实体在真机上**全部长期为 unknown** —— 设备不上报这些
+读取字段，集成侧也没有别的读取路径可以拿到。
+
+保留它们只会让设备页被一堆永远没有值的实体占满，用户还会以为是集成坏了。
+因此**默认不创建**。
+
+代码并未删除，而是收进 ``_make_diagnostic_entities()``，由模块级开关
+``_ENABLE_DIAGNOSTIC_ENTITIES``（当前 False）控制。
+若日后在真机上确认这些字段**确实会上报**（例如固件升级后行为改变），
+把该开关改为 True 即可全部恢复，无需重新实现。
+
+注意：开关打开后取值逻辑仍是原样——按 Profile 字段读取，不做任何猜测；
+设备不上报时依然显示 unknown。这是刻意的：宁可显示 unknown，
+也不给一个编造出来的网络状态。
+
+=====================================================================
 尚未验证（需真机确认）
 =====================================================================
-[ ] 状态读取：全部字段未在真机实测，仅依据 Profile 权限/枚举推导。
+[已实测] 状态读取：**正确**。在智慧生活 App 里控制空调后，HA 显示全部一致。
+[已实测] 控制命令：**温度与模式下发生效**；**单独下发开关不生效**
+    （见上方"真机实测记录"）。开关已改为"先 mode 再 switch.on"两步下发。
+[ ] **关机是否生效（待确认）**：见上方真机实测记录末尾。这决定两步策略
+    是否需要进一步调整。
+[ ] 开机两步下发的**附加效果**：先发 mode 会顺带把空调切到该模式。
+    若用户原本只想要"开机并保持原模式"，请确认 `_current_hvac()` 读到的
+    上报模式确实等于用户预期（设备上报滞后时可能用到回退值 cool）。
 [ ] **模式语义（最高优先级）**：见上方"模式枚举"一节。装好后请逐档
     验证 制热/送风/除湿 是否与实物一致。
-[ ] 控制命令：climate 的开关/模式/温度/风速，以及 5 个 switch、
-    6 个 select，均未实测。
+[ ] 其余控制命令：climate 的风速，以及 5 个 switch、6 个 select，
+    均未实测。
 [ ] 温度步进：Profile 声明 step=0.5、范围 16.0~30.0。写温度时按 0.5
     对齐并夹取到该范围。
 [ ] 智清洁模式（快速/高温/全面/关闭）与电辅热模式（持续/自动/关闭）
@@ -141,6 +216,12 @@ from typing import Any
 
 from .api import EntitySpec
 from .context import DeviceContext
+
+# 诊断实体（netInfo / update）总开关。
+# 真机实测：这些实体全部为 unknown，设备不上报对应字段。
+# 默认关闭以免污染界面；若日后确认真机会上报，改为 True 即可恢复。
+_ENABLE_DIAGNOSTIC_ENTITIES = False
+
 
 # --- 温度范围：取自本机 Profile（float，步进 0.5） -------------------
 _TEMP_MIN = 16.0
@@ -390,28 +471,90 @@ def _switch_off_value(context: DeviceContext) -> Any:
     return _enum_value(_field(context.profile, "switch", "on"), 0, 0)
 
 
+def _mode_payload(context: DeviceContext, hvac: str) -> dict[str, Any]:
+    """Build the ``mode`` service payload for one HA hvac mode."""
+
+    device_value = _HVAC_TO_DEV.get(hvac)
+    if device_value is None:
+        raise ValueError(f"unsupported hvac_mode: {hvac}")
+    field = _field(context.profile, "mode", "mode")
+    return {"mode": _enum_value(field, device_value, device_value)}
+
+
+def _current_hvac(context: DeviceContext) -> str | None:
+    """Return the hvac mode the device currently reports, if recognised."""
+
+    raw = _number(context.value("mode", "mode"))
+    if raw is None:
+        return None
+    return _DEV_TO_HVAC.get(int(raw))
+
+
 async def _turn_on(context: DeviceContext, _data: Mapping[str, Any]) -> None:
+    """Power the AC on, keeping the mode the device currently reports.
+
+    ★ 真机实测（用户报告）：在 HA 里"打开空调"不生效。
+
+    根因**不在开关字段本身**，而在旧版 ``_set_hvac_mode`` 的逻辑缺口：
+
+        HA 的 climate 界面（本机只声明 hvac_modes + 温度/风速）里，
+        用户是通过**模式下拉菜单**操作的，没有独立电源按钮。
+        而旧版代码在选非 off 模式时**只发 mode，从不置电源位**：
+
+            if wanted == "off": await _turn_off(...)   # 发 switch.on=0
+            else:               await send("mode", ...) # 只有 mode！
+
+        于是当空调处于关机态、用户从下拉选「制冷」时，
+        设备收到 mode=2 但电源位仍是 0 -> **空调不开机**。
+        而选「关」时确实发了 switch.on=0，所以"关机生效"。
+
+    这解释了为什么现象是"读正常、关正常、开机不生效"——
+    不是写入通道问题，也不是 payload 类型问题
+    （on/off 两个取值都是 int，编码对称，已验证）。
+
+    修复：选任何非 off 模式时，**先把模式写下去，再补一个开机位**。
+    这样"选模式"既能切模式、也能把关机状态的空调开起来，
+    与用户在智慧生活 App 里的操作预期一致。
+
+    为什么用"当前上报的模式"而不是硬编码：
+      * 保持用户的选择，不擅自把空调切到制冷；
+      * 仅在设备没上报过模式、或上报值不在映射表内时回退到 cool。
+
+    注：本机 Profile 里 ``switch.on`` 声明为 ``method=RW``、``perm=GPR``，
+    是货真价实的可写电源位——旧版只是**没有去写它**。
+    """
+
+    mode = _current_hvac(context) or "cool"
+    await context.async_send_service("mode", _mode_payload(context, mode))
     await context.async_send_service("switch", {"on": _switch_on_value(context)})
 
 
 async def _turn_off(context: DeviceContext, _data: Mapping[str, Any]) -> None:
+    """Power the AC off by clearing the switch bit.
+
+    该路径已由用户真机确认**生效**（"关机是生效的"）。
+    """
+
     await context.async_send_service("switch", {"on": _switch_off_value(context)})
 
 
 async def _set_hvac_mode(context: DeviceContext, data: Mapping[str, Any]) -> None:
-    """Set the device mode; ``off`` is handled by the switch service."""
+    """Set the device mode.
+
+    这是 HA climate 界面上用户最常走的路径（模式下拉菜单）。
+    非 off 模式必须**同时把空调开起来**，否则在关机态下选模式不会有效果
+    （见 ``_turn_on`` 的说明）。
+    """
 
     wanted = str(data.get("hvac_mode"))
     if wanted == "off":
         await _turn_off(context, data)
         return
-    device_value = _HVAC_TO_DEV.get(wanted)
-    if device_value is None:
+    if wanted not in _HVAC_TO_DEV:
         raise ValueError(f"unsupported hvac_mode: {wanted}")
-    field = _field(context.profile, "mode", "mode")
-    await context.async_send_service(
-        "mode", {"mode": _enum_value(field, device_value, device_value)}
-    )
+    await context.async_send_service("mode", _mode_payload(context, wanted))
+    # 关键：补开机位。缺了这一步，关机态下选模式不会启动空调。
+    await context.async_send_service("switch", {"on": _switch_on_value(context)})
 
 
 async def _set_temperature(context: DeviceContext, data: Mapping[str, Any]) -> None:
@@ -705,53 +848,72 @@ class Product2RK1Adapter:
                 )
             )
 
-        # --- 网络诊断 -------------------------------------------------
-        if context.has_service("netInfo"):
-            entities.append(
-                _make_sensor(
-                    "netInfo", "intensity", "wifi_signal_level",
-                    "Wi-Fi 信号格数",
-                    state_class="measurement", entity_category="diagnostic",
-                    decode=lambda value: _SIGNAL_LEVELS.get(_int(value) or -1),
-                )
-            )
-            entities.append(
-                _make_sensor(
-                    "netInfo", "RSSI", "wifi_rssi", "Wi-Fi 信号强度",
-                    unit="dBm", device_class="signal_strength",
-                    state_class="measurement", entity_category="diagnostic",
-                    decode=_int,
-                )
-            )
-            entities.append(
-                _make_sensor(
-                    "netInfo", "IP", "ip_address", "IP 地址",
-                    entity_category="diagnostic", decode=_text,
-                )
-            )
-            entities.append(
-                _make_sensor(
-                    "netInfo", "SSID", "wifi_ssid", "Wi-Fi SSID",
-                    entity_category="diagnostic", decode=_text,
-                )
-            )
-            entities.append(
-                _make_sensor(
-                    "netInfo", "BSSID", "bssid", "路由器 BSSID",
-                    entity_category="diagnostic", decode=_text,
-                )
-            )
-
-        # --- 固件版本（诊断） -----------------------------------------
-        if context.has_service("update"):
-            entities.append(
-                _make_sensor(
-                    "update", "version", "firmware_version", "固件版本",
-                    entity_category="diagnostic", decode=_text,
-                )
-            )
+        # --- 诊断实体（默认关闭，见文件头说明） ----------------------
+        if _ENABLE_DIAGNOSTIC_ENTITIES:
+            entities.extend(_make_diagnostic_entities(context))
 
         return tuple(entities)
 
+
+
+def _make_diagnostic_entities(
+    context: DeviceContext,
+) -> tuple[EntitySpec, ...]:
+    """Build the netInfo / update diagnostic entities.
+
+    默认不创建（见 ``_ENABLE_DIAGNOSTIC_ENTITIES``）。代码保留是为了：
+    若日后在真机上确认这些字段**确实会上报**，把开关打开即可恢复，
+    无需重新实现。取值逻辑未做任何猜测，仍是按 Profile 的字段读取。
+    """
+
+    out: list[EntitySpec] = []
+
+    # --- 网络诊断 -------------------------------------------------
+    if context.has_service("netInfo"):
+        out.append(
+            _make_sensor(
+                "netInfo", "intensity", "wifi_signal_level",
+                "Wi-Fi 信号格数",
+                state_class="measurement", entity_category="diagnostic",
+                decode=lambda value: _SIGNAL_LEVELS.get(_int(value) or -1),
+            )
+        )
+        out.append(
+            _make_sensor(
+                "netInfo", "RSSI", "wifi_rssi", "Wi-Fi 信号强度",
+                unit="dBm", device_class="signal_strength",
+                state_class="measurement", entity_category="diagnostic",
+                decode=_int,
+            )
+        )
+        out.append(
+            _make_sensor(
+                "netInfo", "IP", "ip_address", "IP 地址",
+                entity_category="diagnostic", decode=_text,
+            )
+        )
+        out.append(
+            _make_sensor(
+                "netInfo", "SSID", "wifi_ssid", "Wi-Fi SSID",
+                entity_category="diagnostic", decode=_text,
+            )
+        )
+        out.append(
+            _make_sensor(
+                "netInfo", "BSSID", "bssid", "路由器 BSSID",
+                entity_category="diagnostic", decode=_text,
+            )
+        )
+
+    # --- 固件版本（诊断） -----------------------------------------
+    if context.has_service("update"):
+        out.append(
+            _make_sensor(
+                "update", "version", "firmware_version", "固件版本",
+                entity_category="diagnostic", decode=_text,
+            )
+        )
+
+    return tuple(out)
 
 ADAPTER = Product2RK1Adapter()
